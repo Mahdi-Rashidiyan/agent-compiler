@@ -1,93 +1,156 @@
 """
-examples/branching_agent_real.py
-==================================
-Agent 3 — Sentiment Branch Agent (REAL LLM CALLS)
+benchmarks/benchmark_real.py
+==============================
+REAL benchmark — actual Groq API calls, actual wall-clock timing.
 
-Classifies customer feedback → routes to positive or negative response.
-80% of real customer feedback is positive → speculative execution fires.
+This is the number you show to VCs and put in the README.
 
-Pass 3 win: draft_positive pre-starts concurrently with classify_sentiment.
-  Unoptimised:  classify (2s) → draft (2s) → compose (1s) = ~5s
-  Optimised:    [classify ∥ draft_positive] = max(2,2) = 2s → compose 1s = ~3s
-  Speedup:      ~1.5×
+Setup:
+    pip install groq
+    export GROQ_API_KEY="your_key_here"
+
+Run:
+    cd agentcompiler
+    python -m benchmarks.benchmark_real
 """
 
-from agentcompiler.graph import ExecutionGraph, LLMConfig, Node, NodeType
-from agentcompiler.backends.groq_backend import groq_call
+from __future__ import annotations
 
-MODEL    = "llama-3.3-70b-versatile"
-FEEDBACK = (
-    "The product was absolutely outstanding. "
-    "Setup was seamless, performance exceeded all expectations. "
-    "Genuinely one of the best purchases I have made this year."
-)
+import asyncio
+import sys
+import time
+from typing import Callable, Dict, Tuple
 
+sys.path.insert(0, ".")
 
-async def classify_sentiment(ctx: dict) -> bool:
-    result = await groq_call(
-        f"Classify the sentiment of this customer feedback. "
-        f"Reply with ONLY one word — either 'positive' or 'negative', nothing else.\n\n"
-        f"Feedback: '{FEEDBACK}'",
-        model=MODEL,
-        max_tokens=5,
-    )
-    return "positive" in result.strip().lower()
+from agentcompiler.compiler import AgentCompiler
+from agentcompiler.graph import ExecutionGraph
+from agentcompiler.passes.parallelism import ParallelismExtractionPass
+from agentcompiler.passes.merging import LLMCallMergingPass
+from agentcompiler.passes.speculative import SpeculativeBranchPass
+from agentcompiler.runtime.executor import AgentExecutor
 
-
-async def draft_positive(ctx: dict) -> str:
-    return await groq_call(
-        "Write a warm, genuine 2-sentence thank-you response to a customer "
-        "who left very positive feedback about our product.",
-        model=MODEL,
-        temperature=0.7,
-    )
+import examples.research_agent_real  as research
+import examples.pipeline_agent_real  as pipeline
+import examples.branching_agent_real as branching
 
 
-async def draft_negative(ctx: dict) -> str:
-    return await groq_call(
-        "Write a professional, empathetic 2-sentence apology response to a customer "
-        "who left negative feedback about our product.",
-        model=MODEL,
-        temperature=0.7,
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def timed_run(graph: ExecutionGraph) -> Tuple[float, Dict]:
+    executor = AgentExecutor()
+    t0 = time.perf_counter()
+    result = await executor.run(graph)
+    return time.perf_counter() - t0, result
 
 
-async def compose_reply(ctx: dict) -> str:
-    pos  = ctx.get("draft_positive", "")
-    neg  = ctx.get("draft_negative", "")
-    body = pos or neg
-    return await groq_call(
-        f"Format this into a final customer service email reply. "
-        f"Add a subject line and professional sign-off: '{body}'",
-        model=MODEL,
-        max_tokens=300,
-        temperature=0.3,
-    )
+async def run_pair(
+    builder: Callable,
+    passes,
+    cooldown: float = 10.0,
+) -> Tuple[float, float, Dict, Dict]:
+    """
+    Run unoptimised then optimised, with a cooldown between runs
+    to avoid Groq rate limits.
+    """
+    print(f"    Running unoptimised...", flush=True)
+    t_raw, raw_result = await timed_run(builder())
+
+    print(f"    Cooling down {cooldown}s (rate limit buffer)...", flush=True)
+    await asyncio.sleep(cooldown)
+
+    compiler  = AgentCompiler(passes=passes)
+    opt_graph = compiler.compile(builder())
+
+    print(f"    Running optimised...", flush=True)
+    t_opt, opt_result = await timed_run(opt_graph)
+
+    return t_raw, t_opt, raw_result, opt_result
 
 
-def build() -> ExecutionGraph:
-    c_cfg = LLMConfig(model=MODEL, temperature=0.0, sim_latency_s=2.0)
-    d_cfg = LLMConfig(model=MODEL, temperature=0.7, sim_latency_s=2.0)
-    r_cfg = LLMConfig(model=MODEL, temperature=0.3, sim_latency_s=1.5)
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmarks
+# ─────────────────────────────────────────────────────────────────────────────
 
-    g = ExecutionGraph()
-    g.add_node(Node(
-        "classify_sentiment", NodeType.CONDITION, classify_sentiment,
-        llm_config=c_cfg,
-        true_branch="draft_positive", false_branch="draft_negative", p_true=0.8,
-    ))
-    g.add_node(Node(
-        "draft_positive", NodeType.LLM_CALL, draft_positive,
-        llm_config=d_cfg,
-        metadata={"condition_branch": "classify_sentiment"},
-    ))
-    g.add_node(Node(
-        "draft_negative", NodeType.LLM_CALL, draft_negative,
-        llm_config=d_cfg,
-        metadata={"condition_branch": "classify_sentiment"},
-    ))
-    g.add_node(Node(
-        "compose_reply", NodeType.LLM_CALL, compose_reply,
-        dependencies=["classify_sentiment"], llm_config=r_cfg,
-    ))
-    return g
+BENCHMARKS = [
+    {
+        "name":       "Agent 1 — Research   (3 independent queries + synthesis)",
+        "builder":    research.build,
+        "passes":     [ParallelismExtractionPass()],
+        "label":      "Pass 1 · Parallelism",
+        "result_key": "synthesize",
+    },
+    {
+        "name":       "Agent 2 — QA Pipeline (3 sequential calls, chain merge)",
+        "builder":    pipeline.build,
+        "passes":     [LLMCallMergingPass()],
+        "label":      "Pass 2 · LLM Merging",
+        "result_key": "format_answer",
+    },
+    {
+        "name":       "Agent 3 — Branch      (speculative execution, P=0.80)",
+        "builder":    branching.build,
+        "passes":     [SpeculativeBranchPass()],
+        "label":      "Pass 3 · Speculative",
+        "result_key": "compose_reply",
+    },
+]
+
+DIV = "─" * 74
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    print()
+    print("═" * 74)
+    print("  Tochal — Real Benchmark  (Groq · llama-3.3-70b-versatile)")
+    print("  Concurrency: real asyncio   LLM calls: real Groq API")
+    print("═" * 74)
+
+    rows = []
+
+    for b in BENCHMARKS:
+        print(f"\n▶  {b['name']}")
+        print(f"   Pass: {b['label']}")
+
+        t_raw, t_opt, raw_res, opt_res = await run_pair(b["builder"], b["passes"])
+        speedup = t_raw / t_opt if t_opt > 0 else 0.0
+        rows.append((b["name"], b["label"], t_raw, t_opt, speedup))
+
+        print(f"\n   Unoptimised : {t_raw:.2f}s")
+        print(f"   Optimised   : {t_opt:.2f}s")
+        print(f"   Speedup     : {speedup:.2f}×")
+
+        # Show a snippet of the real LLM output
+        key    = b["result_key"]
+        output = opt_res.get(key, "")
+        if output:
+            snippet = output[:200] + ("..." if len(output) > 200 else "")
+            print(f"\n   Sample output ({key}):")
+            print(f"   {snippet}")
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print()
+    print(DIV)
+    print(f"  {'Agent':<42} {'Pass':<22} {'Raw':>6} {'Opt':>6}  {'×':>6}")
+    print(DIV)
+    for name, label, raw, opt, sp in rows:
+        print(f"  {name[:42]:<42} {label:<22} {raw:>5.2f}s {opt:>5.2f}s  {sp:>5.2f}×")
+    print(DIV)
+    if rows:
+        avg = sum(r[4] for r in rows) / len(rows)
+        print(f"  {'Average speedup (real Groq API)':<68} {avg:>5.2f}×")
+    print(DIV)
+    print()
+    print("  Model:   llama-3.3-70b-versatile  via  api.groq.com")
+    print("  These numbers are real. Copy them into your README.")
+    print()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
